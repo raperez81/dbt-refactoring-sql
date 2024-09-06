@@ -1,47 +1,126 @@
-WITH paid_orders as (select Orders.ID as order_id,
-    Orders.USER_ID	as customer_id,
-    Orders.ORDER_DATE AS order_placed_at,
-        Orders.STATUS AS order_status,
-    p.total_amount_paid,
-    p.payment_finalized_date,
-    C.FIRST_NAME    as customer_first_name,
-        C.LAST_NAME as customer_last_name
-FROM raw.jaffle_shop.orders as Orders
-left join (select ORDERID as order_id, max(CREATED) as payment_finalized_date, sum(AMOUNT) / 100.0 as total_amount_paid
-        from raw.stripe.payment
-        where STATUS <> 'fail'
-        group by 1) p ON orders.ID = p.order_id
-left join raw.jaffle_shop.customers C on orders.USER_ID = C.ID ),
+-- CTEs for Sources
+with base_orders as (
 
-customer_orders 
-as (select C.ID as customer_id
-    , min(ORDER_DATE) as first_order_date
-    , max(ORDER_DATE) as most_recent_order_date
-    , count(ORDERS.ID) AS number_of_orders
-from raw.jaffle_shop.customers C 
-left join raw.jaffle_shop.orders as Orders
-on orders.USER_ID = C.ID 
-group by 1)
+    select * from raw.jaffle_shop.orders 
+
+),
+
+base_payments as (
+
+    select * from raw.stripe.payment
+),
+
+base_customers as (
+
+    select * from raw.jaffle_shop.customers
+
+),
+
+-- Small transformations like rename columns, etc
+orders as (
+
+    select
+        id as order_id
+        , user_id as customer_id
+        , order_date as order_placed_at
+        , status as order_status
+        , _etl_loaded_at
+    from base_orders
+
+),
+
+customers as (
+    
+    select
+        id as customer_id
+        , first_name as customer_first_name
+        , last_name as customer_last_name
+    from base_customers
+
+),
+
+payments as (
+
+    select
+        id as payment_id
+        , orderid as order_id
+        , paymentmethod as payment_method
+        , status as payment_status
+        , amount as payment_amount
+        , created as payment_created
+        , _batched_at
+    from base_payments
+
+),
+
+-- Staging models
+orders_with_finalized_payments as (
+
+    select 
+        order_id
+        , max(payment_created) as payment_finalized_date
+        , sum(payment_amount) / 100.0 as total_amount_paid
+    from payments
+    where payment_status <> 'fail'
+    group by 1
+
+),
+
+paid_orders as (
+
+    select 
+        orders.order_id
+        , orders.customer_id
+        , orders.order_placed_at
+        , orders.order_status
+        , orders_with_finalized_payments.total_amount_paid
+        , orders_with_finalized_payments.payment_finalized_date
+        , customers.customer_first_name
+        , customers.customer_last_name
+    from orders
+    left join orders_with_finalized_payments ON orders.order_id = orders_with_finalized_payments.order_id
+    left join customers on orders.customer_id = customers.customer_id 
+
+),
+
+customer_orders as (
+
+    select 
+        customers.customer_id
+        , min(orders.order_placed_at) as first_order_date
+        , max(orders.order_placed_at) as most_recent_order_date
+        , count(orders.order_id) AS number_of_orders
+    from customers
+    left join orders on customers.customer_id = orders.customer_id
+    group by 1
+
+),
+-- todo: rename x to explain better the purpose of the CTE
+x as (
+    select
+        paid_orders.order_id
+        , sum(t2.total_amount_paid) as customer_lifetime_value
+    from paid_orders
+    left join paid_orders t2 
+    on paid_orders.customer_id = t2.customer_id 
+    and paid_orders.order_id >= t2.order_id
+    group by 1
+    --order by paid_orders.order_id
+
+)
 
 select
-p.*,
-ROW_NUMBER() OVER (ORDER BY p.order_id) as transaction_seq,
-ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY p.order_id) as customer_sales_seq,
-CASE WHEN c.first_order_date = p.order_placed_at
-THEN 'new'
-ELSE 'return' END as nvsr,
-x.clv_bad as customer_lifetime_value,
-c.first_order_date as fdos
-FROM paid_orders p
-left join customer_orders as c USING (customer_id)
-LEFT OUTER JOIN 
-(
-        select
-        p.order_id,
-        sum(t2.total_amount_paid) as clv_bad
-    from paid_orders p
-    left join paid_orders t2 on p.customer_id = t2.customer_id and p.order_id >= t2.order_id
-    group by 1
-    order by p.order_id
-) x on x.order_id = p.order_id
-ORDER BY order_id
+    paid_orders.*
+    , row_number() over (order by paid_orders.order_id) as transaction_seq
+    , row_number() over (partition by paid_orders.customer_id order by paid_orders.order_id) as customer_sales_seq
+    , case 
+        when customer_orders.first_order_date = paid_orders.order_placed_at
+        then 'new'
+        else 'return' 
+    end as nvsr
+    , x.customer_lifetime_value
+    , customer_orders.first_order_date as fdos
+from paid_orders
+left join customer_orders on paid_orders.customer_id = customer_orders.customer_id
+left join x on x.order_id = paid_orders.order_id
+order by order_id
